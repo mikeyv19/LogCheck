@@ -1,0 +1,8 @@
+# Personal settings + Warcraft Logs API credentials/token - never commit
+logcheck_config.json
+
+# Windows shortcut (contains local paths)
+*.lnk
+
+__pycache__/
+*.pyc
