@@ -26,7 +26,9 @@ CONFIG_PATH = Path(__file__).with_name("logcheck_config.json")
 TOKEN_URL = "https://www.warcraftlogs.com/oauth/token"
 API_URL = "https://www.warcraftlogs.com/api/v2/client"
 
-DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_pct": "", "min_key": "", "dungeon": "", "keep": False}
+DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_pct": "", "min_key": "", "dungeon": "", "keep": False,
+            "expand_new": True, "sort_col": "", "sort_desc": True}
+TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
 ALL_DUNGEONS = "All dungeons"
 
 # Warcraft Logs parse colors: (min percent, color)
@@ -43,6 +45,8 @@ PARSE_COLORS = [
 BG = "#1e1e1e"
 FG = "#dddddd"
 HEADER_BG = "#2d2d30"
+HOVER_BG = "#3e3e42"  # hovered button/heading; dark enough for FG text
+PRESS_BG = "#094771"
 
 
 # ---------------------------------------------------------------- config/api
@@ -79,6 +83,38 @@ def realm_slug(realm):
     """'Area 52' -> 'area-52', "Mal'Ganis" -> 'malganis'."""
     s = realm.strip().lower().replace("'", "")
     return re.sub(r"[\s_]+", "-", s)
+
+
+def realm_key(realm):
+    """Spelling-insensitive realm key: 'Area 52', 'Area52', 'area-52' -> 'area52'."""
+    return re.sub(r"[\W_]+", "", realm.lower())
+
+
+def realm_slugs(cfg, region):
+    """{realm_key: WCL slug} for a region, from WCL's server list (all regions cached on first use)."""
+    cache = cfg.get("realm_slugs") or {}
+    if region not in cache:
+        pages = " ".join(f"p{n}: servers(limit: 100, page: {n}) {{ data {{ name slug }} }}" for n in range(1, 6))
+        data = post_query(cfg, f"{{ worldData {{ regions {{ slug {pages} }} }} }}")
+        cache = {}
+        for r in (data.get("worldData") or {}).get("regions") or []:
+            slugs = cache.setdefault(r["slug"].lower(), {})
+            for n in range(1, 6):
+                for server in (r.get(f"p{n}") or {}).get("data") or []:
+                    slugs[realm_key(server["name"])] = server["slug"]
+                    slugs[realm_key(server["slug"])] = server["slug"]
+        cfg["realm_slugs"] = cache
+        save_config(cfg)
+    return cache.get(region, {})
+
+
+def resolve_slug(cfg, region, realm):
+    """WCL slug for a realm however it's typed ('MoonGuard' -> 'moon-guard'); falls back to realm_slug."""
+    try:
+        slugs = realm_slugs(cfg, region)
+    except Exception:  # server list is a nice-to-have; never block a lookup on it
+        slugs = {}
+    return slugs.get(realm_key(realm)) or realm_slug(realm)
 
 
 def parse_characters(text):
@@ -162,20 +198,21 @@ def summarize_dungeon(name, rankings):
 def fetch_rankings(cfg, chars, region, zone, metric):
     """One GraphQL request for every character x dungeon, using aliases.
 
-    Returns (results, rate_limit). Per character: None if not found, else
-    {"name", "error", "dungeons"}.
+    Returns (results, slugs, rate_limit). Per character: None if not found, else
+    {"name", "error", "dungeons"}. slugs are the resolved WCL realm slugs.
     """
     if not zone.strip():
         raise ValueError("Zone ID is required")
     encounters = zone_encounters(cfg, int(zone))
+    slugs = [resolve_slug(cfg, region, realm) for _, realm in chars]
     enc_fields = " ".join(
         f"e{j}: encounterRankings(encounterID: {eid}, metric: {metric}, byBracket: true)"
         for j, (eid, _) in enumerate(encounters)
     )
     parts = [
-        f"c{i}: character(name: {gql_str(name)}, serverSlug: {gql_str(realm_slug(realm))}, "
+        f"c{i}: character(name: {gql_str(name)}, serverSlug: {gql_str(slug)}, "
         f"serverRegion: {gql_str(region)}) {{ name {enc_fields} }}"
-        for i, (name, realm) in enumerate(chars)
+        for i, ((name, _), slug) in enumerate(zip(chars, slugs))
     ]
     data = post_query(
         cfg,
@@ -196,7 +233,7 @@ def fetch_rankings(cfg, chars, region, zone, metric):
             error = error or er.get("error")
             dungeons.append(summarize_dungeon(ename, er))
         results.append({"name": char["name"], "error": error, "dungeons": dungeons})
-    return results, data.get("rateLimitData")
+    return results, slugs, data.get("rateLimitData")
 
 
 def fmt_rate(rate):
@@ -234,6 +271,12 @@ def fmt_key(key, timed):
     return f"+{key}" if timed else f"{key} \u2717"
 
 
+def sort_by(items, value, desc):
+    """Sorts items by value(item); items whose value is None always go last."""
+    present = sorted((i for i in items if value(i) is not None), key=value, reverse=desc)
+    return present + [i for i in items if value(i) is None]
+
+
 def mean(values):
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
@@ -243,8 +286,13 @@ HELP_TEXT = """\
 HOW TO USE
   Type characters as "Name Realm" or "Name-Realm", separated by commas, then
   press Enter. All characters are fetched in one request, so a whole group is
-  as fast as one person. Double-click a character's name to open their
-  Warcraft Logs page.
+  as fast as one person. Names copied from in-game work too, e.g.
+  "Name-MoonGuard" or "Name-Area52" (realm spaces are optional).
+  Double-click a character's name to open their Warcraft Logs page, or
+  right-click it to open Warcraft Logs / Raider.IO, copy Name-Realm, or
+  remove them.
+
+  Click a column header to sort by it (click again to flip the order).
 
   Tick "Keep adding" to stack lookups: each search adds to the list instead
   of replacing it (searching someone already listed refreshes them), so you
@@ -271,8 +319,15 @@ COLUMNS
             key level). Half their runs are above, half below.
   Runs      Number of logged runs behind the numbers.
   Spec      Spec used on the highest key.
-  Bold row  The character: highest timed key anywhere, and averages of
-            Key % and Median % across dungeons.
+  Bold row  The character: highest timed key anywhere, averages of Key %,
+            DPS and Median % across dungeons, total runs, and the spec
+            on their highest key.
+
+SORTING
+  Click any column header to sort by it; click again to flip the order
+  (\u25bc high-to-low, \u25b2 low-to-high). Characters are sorted by their bold
+  row, and each character's dungeons by the same column. The sort stays
+  as people are added or filters change, and is remembered next time.
 
 COLORS  (rows are colored by whatever "Judge by" is set to)
   Gray    0-24    below average
@@ -319,7 +374,7 @@ CAVEATS
   - Tanks and healers look low on DPS. Switch Metric to hps for healers."""
 
 COLUMN_TIPS = {
-    "#0": "Dungeon. Bold rows are the character (double-click to open WCL).",
+    "#0": "Dungeon. Bold rows are the character (double-click to open WCL). Click any header to sort.",
     "key": "Highest key run in this dungeon. +17 = timed, 17 \u2717 = depleted.",
     "keypct": "Percentile on their highest key, vs same spec at the same key level.",
     "amount": "DPS on their highest key.",
@@ -485,15 +540,21 @@ class App:
         self.rows = []  # one dict per listed character: name, realm, region, zone, metric, char
         self.done_msg = ""
         self.items = {}  # character tree item id -> row
+        self.expanded = {}  # _row_id -> whether that character's dungeons are shown
 
         self.keep = tk.BooleanVar(value=bool(self.cfg["keep"]))
         keep_box = ttk.Checkbutton(top, text="Keep adding", variable=self.keep, command=self.save_keep)
         keep_box.grid(row=3, column=4, columnspan=2, sticky="w", pady=(6, 0))
+        self.expand_new = tk.BooleanVar(value=bool(self.cfg["expand_new"]))
+        expand_box = ttk.Checkbutton(top, text="Expand new", variable=self.expand_new, command=self.save_expand)
+        expand_box.grid(row=3, column=6, sticky="e", padx=(0, 6), pady=(6, 0))
         clear_btn = ttk.Button(top, text="Clear", command=self.clear)
         clear_btn.grid(row=3, column=7, sticky="e", pady=(6, 0))
         Tooltip(root, keep_box, "On: each search adds characters to the list instead of replacing it, "
                 "so you can compare many people. Re-searching someone refreshes their data.")
         Tooltip(root, clear_btn, "Remove everyone from the list.")
+        Tooltip(root, expand_box, "On: newly added characters show their dungeons. Off: they're added "
+                "collapsed, for a compact list. People already listed keep however you left them.")
 
         help_btn = ttk.Button(top, text="?", width=3, command=self.show_help)
         help_btn.grid(row=1, column=6, sticky="e", padx=(0, 6), pady=(6, 0))
@@ -517,7 +578,9 @@ class App:
 
         cols = ("key", "keypct", "amount", "median", "runs", "spec", "remove")
         self.tree = ttk.Treeview(root, columns=cols, show="tree headings")
-        self.tree.heading("#0", text="Dungeon", anchor="w")
+        self.titles = {"#0": "Dungeon"}
+        self.sort_col, self.sort_desc = self.cfg["sort_col"], self.cfg["sort_desc"]
+        self.tree.heading("#0", anchor="w", command=lambda: self.sort_on("#0"))
         self.tree.column("#0", width=240)
         for col, title, width in [
             ("key", "Key", 55),
@@ -528,12 +591,19 @@ class App:
             ("spec", "Spec", 110),
             ("remove", "", 30),
         ]:
-            self.tree.heading(col, text=title)
+            self.titles[col] = title
+            if col != "remove":
+                self.tree.heading(col, command=lambda c=col: self.sort_on(c))
             self.tree.column(col, width=width, anchor="center")
+        self.update_headings()
         self.tree.pack(fill="both", expand=True, padx=8)
         self.tree.bind("<Double-1>", self.open_link)
         self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<Delete>", lambda e: self.remove(self.tree.focus()))
+        self.tree.bind("<Button-3>", self.show_menu)
+        self.menu = tk.Menu(
+            root, tearoff=0, bg=HEADER_BG, fg=FG, activebackground="#094771", activeforeground=FG, bd=0
+        )
         self.head_tip, self.head_col = Tooltip(root), None
         self.tree.bind("<Motion>", self.on_tree_motion)
         self.tree.bind("<Leave>", lambda e: self._hide_head_tip())
@@ -559,12 +629,29 @@ class App:
         s.theme_use("clam")
         s.configure(".", background=BG, foreground=FG, fieldbackground=HEADER_BG)
         s.configure("TEntry", foreground=FG, insertcolor=FG)
-        s.configure("TCombobox", foreground=FG)
-        s.map("TCombobox", fieldbackground=[("readonly", HEADER_BG)], foreground=[("readonly", FG)])
-        s.configure("TButton", background=HEADER_BG)
+        s.configure("TCombobox", foreground=FG, background=HEADER_BG, arrowcolor=FG)
+        s.map(
+            "TCombobox",
+            fieldbackground=[("readonly", HEADER_BG)],
+            foreground=[("readonly", FG)],
+            background=[("pressed", PRESS_BG), ("active", HOVER_BG)],
+        )
+        s.configure("TButton", background=HEADER_BG, lightcolor=HEADER_BG, darkcolor=HEADER_BG)
+        # clam's default hover/press colors are near-white, which hides the light text
+        s.map(
+            "TButton",
+            background=[("disabled", BG), ("pressed", PRESS_BG), ("active", HOVER_BG)],
+            foreground=[("disabled", "#6d6d6d")],
+            lightcolor=[("pressed", PRESS_BG), ("active", HOVER_BG)],
+            darkcolor=[("pressed", PRESS_BG), ("active", HOVER_BG)],
+        )
+        s.map("TCheckbutton", background=[("active", BG)], foreground=[("active", FG)],
+              indicatorbackground=[("pressed", HOVER_BG), ("active", HOVER_BG)])
+        s.configure("TCheckbutton", indicatorbackground=HEADER_BG, indicatorforeground=FG)
         s.configure("Treeview", background=BG, fieldbackground=BG, foreground=FG, rowheight=22)
         s.configure("Treeview.Heading", background=HEADER_BG, foreground=FG)
-        s.map("Treeview", background=[("selected", "#094771")])
+        s.map("Treeview.Heading", background=[("pressed", PRESS_BG), ("active", HOVER_BG)])
+        s.map("Treeview", background=[("selected", PRESS_BG)])
         self.root.option_add("*TCombobox*Listbox.background", HEADER_BG)
         self.root.option_add("*TCombobox*Listbox.foreground", FG)
 
@@ -642,15 +729,17 @@ class App:
 
         def work():
             try:
-                results, rate = fetch_rankings(self.cfg, chars, region, zone, metric)
+                results, slugs, rate = fetch_rankings(self.cfg, chars, region, zone, metric)
                 err = None
             except Exception as e:  # show any network/API failure in the status bar
-                results, rate, err = None, None, e
-            self.root.after(0, lambda: self.show(chars, region, zone, metric, results, rate, err, started))
+                results, slugs, rate, err = None, None, None, e
+            self.root.after(
+                0, lambda: self.show(chars, region, zone, metric, results, slugs, rate, err, started)
+            )
 
         threading.Thread(target=work, daemon=True).start()
 
-    def show(self, chars, region, zone, metric, results, rate, err, started):
+    def show(self, chars, region, zone, metric, results, slugs, rate, err, started):
         self.btn.state(["!disabled"])
         if err:
             if isinstance(err, urllib.error.HTTPError) and err.code in (400, 401):
@@ -663,8 +752,11 @@ class App:
                 self.status.config(text=f"Error: {err}")
             return
         new = [
-            {"name": name, "realm": realm, "region": region, "zone": zone, "metric": metric, "char": char}
-            for (name, realm), char in zip(chars, results)
+            {
+                "name": name, "realm": realm, "slug": slug, "region": region, "zone": zone,
+                "metric": metric, "char": char,
+            }
+            for (name, realm), slug, char in zip(chars, slugs, results)
         ]
         if self.keep.get():
             ids = {self._row_id(r) for r in new}
@@ -676,6 +768,22 @@ class App:
         self.done_msg = f"Done in {time.perf_counter() - started:.2f}s"
         self.rate_label.config(text=fmt_rate(rate))
         self.render()
+
+    def sort_on(self, col):
+        """Header click: sort by col, or flip the order if already sorting by it."""
+        if col == self.sort_col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col, self.sort_desc = col, col not in TEXT_COLS
+        self.cfg.update(sort_col=self.sort_col, sort_desc=self.sort_desc)
+        save_config(self.cfg)
+        self.update_headings()
+        self.render()
+
+    def update_headings(self):
+        for col, title in self.titles.items():
+            arrow = (" \u25bc" if self.sort_desc else " \u25b2") if col == self.sort_col else ""
+            self.tree.heading(col, text=title + arrow)
 
     def judged_pct(self, key_pct, median):
         return median if self.judge.get() == "Median" else key_pct
@@ -699,47 +807,44 @@ class App:
             judge=self.judge.get(), min_pct=self.min_pct.get(), min_key=self.min_key.get(), dungeon=only
         )
         save_config(self.cfg)
+        for item, row in self.items.items():  # remember what the user expanded/collapsed
+            self.expanded[self._row_id(row)] = bool(self.tree.item(item, "open"))
         self.tree.delete(*self.tree.get_children())
         self.links.clear()
         self.items = {}  # character tree item id -> row
         passed = judged = 0
-        for row in self.rows:
-            name, realm, region, zone, metric, char = (
-                row[k] for k in ("name", "realm", "region", "zone", "metric", "char")
-            )
-            url = (
-                f"https://www.warcraftlogs.com/character/{region}/{realm_slug(realm)}/{name.lower()}"
-                f"?zone={zone}&metric={metric}"
-            )
-            dungeons = [
-                d for d in (char or {}).get("dungeons", []) if d["runs"] and (not only or d["name"] == only)
-            ]
-            if char is None:
-                label = f"{name}-{realm}  (not found)"
-            elif char["error"] and not dungeons:
-                label = f"{char['name']}-{realm}  ({char['error']})"
-            elif only and not dungeons:
-                label = f"{char['name']}-{realm}  (no {only} runs)"
-            else:
-                label = f"{char['name']}-{realm}"
-
-            timed = [d["max_timed"] for d in dungeons if d["max_timed"]]
-            top_key = max(timed) if timed else max((d["key"] for d in dungeons), default=None)
-            key_avg = mean(d["key_pct"] for d in dungeons)
-            med_avg = mean(d["median"] for d in dungeons)
-            verdict = self.judge_pass(key_avg, med_avg, max(timed, default=None))
+        col, desc = self.sort_col, self.sort_desc
+        chars = [self._summarize(row, only) for row in self.rows]
+        if col:
+            chars = sort_by(chars, lambda c: c[col], desc)
+        for c in chars:
+            row, dungeons = c["row"], c["dungeons"]
+            verdict = self.judge_pass(c["keypct"], c["median"], c["max_timed"])
             if verdict is not None:
                 judged += 1
                 passed += verdict
             parent = self.tree.insert(
-                "", "end", text=label, open=True, image=self.icons[verdict],
-                values=(fmt_key(top_key, bool(timed)), fmt_pct(key_avg), "", fmt_pct(med_avg), "", "", "\u2715"),
-                tags=(self._color_tag(self.judged_pct(key_avg, med_avg)), "header"),
+                "", "end", text=c["label"], image=self.icons[verdict],
+                open=self.expanded.setdefault(self._row_id(row), self.expand_new.get()),
+                values=(
+                    fmt_key(c["top_key"], c["timed"]),
+                    fmt_pct(c["keypct"]),
+                    fmt_amount(c["amount"]),
+                    fmt_pct(c["median"]),
+                    c["runs"] or "",
+                    c["spec"] or "",
+                    "\u2715",
+                ),
+                tags=(self._color_tag(self.judged_pct(c["keypct"], c["median"])), "header"),
             )
-            self.links[parent] = url
+            self.links[parent] = c["url"]
             self.items[parent] = row
 
-            for d in sorted(dungeons, key=lambda d: (d["key"] or 0, d["key_pct"] or 0), reverse=True):
+            if col:
+                dungeons = sort_by(dungeons, lambda d: self._dungeon_sort_value(d, col), desc)
+            else:
+                dungeons = sorted(dungeons, key=lambda d: (d["key"] or 0, d["key_pct"] or 0), reverse=True)
+            for d in dungeons:
                 verdict = self.judge_pass(d["key_pct"], d["median"], d["max_timed"])
                 self.tree.insert(
                     parent, "end", image=self.icons[verdict], text=" " + d["name"],
@@ -762,6 +867,58 @@ class App:
         if parts:
             self.status.config(text="  |  ".join(parts))
 
+    @staticmethod
+    def _summarize(row, only):
+        """Character-row numbers (and sort values, keyed by column) for one listed character."""
+        name, realm, char = row["name"], row["realm"], row["char"]
+        dungeons = [
+            d for d in (char or {}).get("dungeons", []) if d["runs"] and (not only or d["name"] == only)
+        ]
+        if char is None:
+            label = f"{name}-{realm}  (not found)"
+        elif char["error"] and not dungeons:
+            label = f"{char['name']}-{realm}  ({char['error']})"
+        elif only and not dungeons:
+            label = f"{char['name']}-{realm}  (no {only} runs)"
+        else:
+            label = f"{char['name']}-{realm}"
+
+        timed = [d["max_timed"] for d in dungeons if d["max_timed"]]
+        top_key = max(timed) if timed else max((d["key"] for d in dungeons), default=None)
+        top = max(dungeons, key=lambda d: (d["key"] or 0, d["timed"]), default=None)
+        return {
+            "row": row,
+            "dungeons": dungeons,
+            "label": label,
+            "url": (
+                f"https://www.warcraftlogs.com/character/{row['region']}/{row['slug']}/{name.lower()}"
+                f"?zone={row['zone']}&metric={row['metric']}"
+            ),
+            "top_key": top_key,
+            "timed": bool(timed),
+            "max_timed": max(timed, default=None),
+            # sort values, by column
+            "#0": label.lower(),
+            "key": (top_key, bool(timed)) if top_key else None,
+            "keypct": mean(d["key_pct"] for d in dungeons),
+            "amount": mean(d["dps"] for d in dungeons),
+            "median": mean(d["median"] for d in dungeons),
+            "runs": sum(d["runs"] for d in dungeons) or None,
+            "spec": top["spec"] if top and top["spec"] else None,
+        }
+
+    @staticmethod
+    def _dungeon_sort_value(d, col):
+        return {
+            "#0": d["name"].lower(),
+            "key": (d["key"], d["timed"]) if d["key"] else None,
+            "keypct": d["key_pct"],
+            "amount": d["dps"],
+            "median": d["median"],
+            "runs": d["runs"],
+            "spec": d["spec"].lower() or None,
+        }[col]
+
     def _color_tag(self, pct):
         color = parse_color(pct)
         tag = "c" + color.lstrip("#")
@@ -770,10 +927,14 @@ class App:
 
     @staticmethod
     def _row_id(row):
-        return (row["name"].lower(), realm_slug(row["realm"]), row["region"])
+        return (row["name"].lower(), row["slug"], row["region"])
 
     def save_keep(self):
         self.cfg["keep"] = self.keep.get()
+        save_config(self.cfg)
+
+    def save_expand(self):
+        self.cfg["expand_new"] = self.expand_new.get()
         save_config(self.cfg)
 
     def on_tree_click(self, event):
@@ -788,11 +949,40 @@ class App:
         row = self.items.get(item)
         if row is not None:
             self.rows.remove(row)
+            self.items.pop(item)
+            self.expanded.pop(self._row_id(row), None)
             self.done_msg = ""
             self.render()
 
+    def show_menu(self, event):
+        """Right-click on a character (or one of their dungeons): open/copy/remove."""
+        item = self.tree.identify_row(event.y)
+        item = self.tree.parent(item) or item
+        row = self.items.get(item)
+        if row is None:
+            return
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        name = (row["char"] or {}).get("name") or row["name"]
+        full = f"{name}-{row['realm']}"
+        raiderio = f"https://raider.io/characters/{row['region']}/{row['slug']}/{urllib.parse.quote(name)}"
+        self.menu.delete(0, "end")
+        self.menu.add_command(label="Open Warcraft Logs", command=lambda: webbrowser.open(self.links[item]))
+        self.menu.add_command(label="Open Raider.IO", command=lambda: webbrowser.open(raiderio))
+        self.menu.add_command(label=f"Copy {full}", command=lambda: self.copy(full))
+        self.menu.add_separator()
+        self.menu.add_command(label="Remove", command=lambda: self.remove(item))
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def copy(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status.config(text=f"Copied {text}")
+
     def clear(self):
         self.rows = []
+        self.items = {}
+        self.expanded = {}
         self.done_msg = ""
         self.render()
         self.status.config(text="List cleared")

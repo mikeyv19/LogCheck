@@ -13,8 +13,10 @@ DPS, median percentile across all runs, and run count. Every character is fetche
   dungeon and per character.
 - **Dungeon filter.** Show only one dungeon, such as the key you're forming for. Your choice is remembered.
 - **Keep adding mode.** Stack several lookups into one list to compare applicants. Remove people one by
-  one with ✕, or clear the whole list.
-- Double-click a name to open their Warcraft Logs page. Press **?** in the app for a full explanation.
+  one with ✕, or clear the whole list. Characters you collapse stay collapsed as you add more. Turn off
+  **Expand new** to add people collapsed, for a compact list.
+- Double-click a name to open their Warcraft Logs page. Right-click a name to open Warcraft Logs or
+  Raider.IO, copy their Name-Realm, or remove them. Press **?** in the app for a full explanation.
 
 ## Requirements
 
@@ -59,7 +61,8 @@ This writes `logcheck.ico`. Right-click `logcheck.pyw` → **Create shortcut**, 
 ## Usage
 
 - Enter characters as `Name Realm` or `Name-Realm`, separated by commas, e.g.
-  `Vardamere Sargeras, Someone-Area 52`.
+  `Vardamere Sargeras, Someone-Area 52`. Names copied from in-game (`Someone-Area52`, `Someone-MoonGuard`)
+  work too, because realms are matched against Warcraft Logs' server list.
 - **Zone ID** is the Warcraft Logs zone (the `?zone=` value in a WCL URL). The default, `55`, is Midnight
   Mythic+ Season 2. The Dungeon filter list comes from the zone you look up.
 - **Metric**: `dps` for damage dealers, `hps` for healers.
