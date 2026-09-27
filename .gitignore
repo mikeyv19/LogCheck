@@ -1,6 +1,9 @@
 # Personal settings + Warcraft Logs API credentials/token - never commit
 logcheck_config.json
 
+# Cached lookups (rebuilt automatically)
+logcheck_cache.json
+
 # Windows shortcut (contains local paths)
 *.lnk
 

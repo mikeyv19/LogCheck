@@ -23,11 +23,14 @@ from pathlib import Path
 from tkinter import simpledialog, ttk
 
 CONFIG_PATH = Path(__file__).with_name("logcheck_config.json")
+CACHE_PATH = Path(__file__).with_name("logcheck_cache.json")
+CACHE_HOURS = 24  # re-checking someone within this long reuses their last lookup
+CACHE_LOCK = threading.Lock()
 TOKEN_URL = "https://www.warcraftlogs.com/oauth/token"
 API_URL = "https://www.warcraftlogs.com/api/v2/client"
 
 DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_mode": "Min %", "min_pct": "", "min_dps": "", "min_key": "", "dungeon": "", "keep": False,
-            "expand_new": True, "sort_col": "", "sort_desc": True,
+            "expand_new": True, "use_cache": True, "sort_col": "", "sort_desc": True,
             "color_by": "parse", "ref_amount": {},  # ref_amount: "zone:metric" -> reference DPS text
             "dps_tiers": {}}  # dps_tiers: "zone:metric" -> {band %: min DPS text} for custom DPS colors
 TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
@@ -200,24 +203,50 @@ def summarize_dungeon(name, rankings):
     }
 
 
-def fetch_rankings(cfg, chars, region, zone, metric):
-    """One GraphQL request for every character x dungeon, using aliases.
+def load_cache():
+    """{cache key: {"t": fetched at, "char": result}}, without entries older than CACHE_HOURS."""
+    try:
+        cache = json.loads(CACHE_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    cutoff = time.time() - CACHE_HOURS * 3600
+    return {k: v for k, v in cache.items() if v.get("t", 0) > cutoff}
 
-    Returns (results, slugs, rate_limit). Per character: None if not found, else
-    {"name", "error", "dungeons"}. slugs are the resolved WCL realm slugs.
+
+def cache_key(region, slug, name, zone, metric):
+    return f"{region}/{slug}/{name.lower()}/{zone.strip()}/{metric}"
+
+
+def fetch_rankings(cfg, chars, region, zone, metric, fresh=False, use_cache=True):
+    """One GraphQL request for every character x dungeon, using aliases. Characters looked up in
+    the last CACHE_HOURS come from the cache instead (unless fresh), and cost no API points.
+    use_cache=False neither reads nor writes the cache.
+
+    Returns (results, slugs, rate_limit, cached). Per character: None if not found, else
+    {"name", "error", "dungeons"}. slugs are the resolved WCL realm slugs. rate_limit is None
+    when everyone was cached; cached is how many were.
     """
     if not zone.strip():
         raise ValueError("Zone ID is required")
     encounters = zone_encounters(cfg, int(zone))
     slugs = [resolve_slug(cfg, region, realm) for _, realm in chars]
+    keys = [cache_key(region, slug, name, zone, metric) for (name, _), slug in zip(chars, slugs)]
+    fresh = fresh or not use_cache
+    with CACHE_LOCK:
+        cache = {} if fresh else load_cache()
+    results = [None if fresh or k not in cache else cache[k]["char"] for k in keys]
+    todo = [i for i, k in enumerate(keys) if fresh or k not in cache]
+    if not todo:
+        return results, slugs, None, len(chars)
+
     enc_fields = " ".join(
         f"e{j}: encounterRankings(encounterID: {eid}, metric: {metric}, byBracket: true)"
         for j, (eid, _) in enumerate(encounters)
     )
     parts = [
-        f"c{i}: character(name: {gql_str(name)}, serverSlug: {gql_str(slug)}, "
+        f"c{i}: character(name: {gql_str(chars[i][0])}, serverSlug: {gql_str(slugs[i])}, "
         f"serverRegion: {gql_str(region)}) {{ name {enc_fields} }}"
-        for i, ((name, _), slug) in enumerate(zip(chars, slugs))
+        for i in todo
     ]
     data = post_query(
         cfg,
@@ -226,19 +255,26 @@ def fetch_rankings(cfg, chars, region, zone, metric):
     )
     char_data = data.get("characterData") or {}
 
-    results = []
-    for i in range(len(chars)):
+    for i in todo:
         char = char_data.get(f"c{i}")
-        if char is None:
-            results.append(None)
-            continue
-        dungeons, error = [], None
-        for j, (_, ename) in enumerate(encounters):
-            er = char.get(f"e{j}") or {}
-            error = error or er.get("error")
-            dungeons.append(summarize_dungeon(ename, er))
-        results.append({"name": char["name"], "error": error, "dungeons": dungeons})
-    return results, slugs, data.get("rateLimitData")
+        if char is not None:
+            dungeons, error = [], None
+            for j, (_, ename) in enumerate(encounters):
+                er = char.get(f"e{j}") or {}
+                error = error or er.get("error")
+                dungeons.append(summarize_dungeon(ename, er))
+            char = {"name": char["name"], "error": error, "dungeons": dungeons}
+        results[i] = char
+    if use_cache:
+        now = time.time()
+        with CACHE_LOCK:
+            cache = load_cache()  # re-read so another lookup's entries aren't lost
+            cache.update({keys[i]: {"t": now, "char": results[i]} for i in todo})
+            try:
+                CACHE_PATH.write_text(json.dumps(cache))
+            except OSError:
+                pass  # the cache only saves API points; never fail a lookup over it
+    return results, slugs, data.get("rateLimitData"), len(chars) - len(todo)
 
 
 def fmt_rate(rate):
@@ -306,6 +342,11 @@ HOW TO USE
   whenever the list changes: only new applicants are looked up (no wasted
   API points), and applicants who left the queue are removed. People you
   added by hand stay. Tip: turn off "Expand new" for a compact list.
+
+  Lookups are cached for 24 hours, so checking the same person again (or
+  re-pasting your applicants) costs no API points. The status bar says how
+  many came from the cache. Right-click a name > "Refresh (skip cache)" to
+  get their latest numbers. Turn the cache off in Options if you prefer.
 
   Tick "Keep adding" to stack lookups: each search adds to the list instead
   of replacing it (searching someone already listed refreshes them), so you
@@ -669,7 +710,8 @@ class App:
         self.rate_label = ttk.Label(footer, text="", foreground="#9d9d9d")
         self.rate_label.pack(side="right")
         Tooltip(root, self.rate_label, "Warcraft Logs API points left this hour. "
-                "Each lookup costs roughly 8 points per character.")
+                "Each lookup costs roughly 8 points per character. Anyone looked up in the last 24 hours "
+                "comes from the cache for free.")
 
     def refresh_dungeons(self):
         """Fills the dungeon filter from the zone's cached encounter list."""
@@ -844,7 +886,20 @@ class App:
         color_by.trace_add("write", update)
         ref.bind("<KeyRelease>", update)
         update()
-        ttk.Button(frame, text="Close", command=win.destroy).grid(row=4, column=0, columnspan=4, pady=(12, 0))
+
+        use_cache = tk.BooleanVar(value=bool(self.cfg["use_cache"]))
+
+        def save_cache():
+            self.cfg["use_cache"] = use_cache.get()
+            save_config(self.cfg)
+
+        cache_box = ttk.Checkbutton(frame, text=f"Cache lookups for {CACHE_HOURS} hours (saves API points)",
+                                    variable=use_cache, command=save_cache)
+        cache_box.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        Tooltip(win, cache_box, "On: checking someone again within 24 hours reuses their last lookup "
+                "for free. Right-click a name > Refresh to skip it for one person. "
+                "Off: every check asks Warcraft Logs.")
+        ttk.Button(frame, text="Close", command=win.destroy).grid(row=5, column=0, columnspan=4, pady=(12, 0))
         win.bind("<Escape>", lambda e: win.destroy())
         win.focus_set()
 
@@ -866,15 +921,20 @@ class App:
         save_config(self.cfg)
         return True
 
-    def search(self, lfg=None):
+    def search(self, lfg=None, refresh=None):
         """Looks up the Characters box. With lfg (the addon's applicant list), syncs the list to it
-        instead: only applicants not already listed are fetched, and applicants who left are removed."""
-        try:
-            chars = parse_characters(self.entry.get() if lfg is None else lfg)
-        except ValueError as e:
-            self.status.config(text=str(e))
-            return
-        region, metric, zone = self.region.get(), self.metric.get(), self.zone.get()
+        instead: only applicants not already listed are fetched, and applicants who left are removed.
+        With refresh (a listed row), looks that character up again, skipping the cache."""
+        if refresh is not None:
+            chars = [(refresh["name"], refresh["realm"])]
+            region, metric, zone = refresh["region"], refresh["metric"], refresh["zone"]
+        else:
+            try:
+                chars = parse_characters(self.entry.get() if lfg is None else lfg)
+            except ValueError as e:
+                self.status.config(text=str(e))
+                return
+            region, metric, zone = self.region.get(), self.metric.get(), self.zone.get()
         applied = None
         if lfg is not None:
             fresh = {}  # applicant key -> (name, realm), without repeats
@@ -888,8 +948,9 @@ class App:
                 return
         if not chars or not self.ensure_credentials():
             return
-        self.cfg.update(region=region, metric=metric, zone=zone)
-        save_config(self.cfg)
+        if refresh is None:
+            self.cfg.update(region=region, metric=metric, zone=zone)
+            save_config(self.cfg)
 
         self.btn.state(["disabled"])
         self.status.config(text=f"Fetching {len(chars)} character(s)...")
@@ -897,13 +958,16 @@ class App:
 
         def work():
             try:
-                results, slugs, rate = fetch_rankings(self.cfg, chars, region, zone, metric)
+                results, slugs, rate, cached = fetch_rankings(
+                    self.cfg, chars, region, zone, metric, fresh=refresh is not None,
+                    use_cache=self.cfg["use_cache"],
+                )
                 err = None
             except Exception as e:  # show any network/API failure in the status bar
-                results, slugs, rate, err = None, None, None, e
-            self.root.after(
-                0, lambda: self.show(chars, region, zone, metric, results, slugs, rate, err, started, applied)
-            )
+                results, slugs, rate, cached, err = None, None, None, 0, e
+            self.root.after(0, lambda: self.show(
+                chars, region, zone, metric, results, slugs, rate, err, started, applied, refresh, cached
+            ))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -925,9 +989,11 @@ class App:
         self.search()
         return "break"
 
-    def show(self, chars, region, zone, metric, results, slugs, rate, err, started, applied=None):
-        """applied: every applicant key from an addon paste (see search), else None.
-        started is None when nothing was fetched."""
+    def show(self, chars, region, zone, metric, results, slugs, rate, err, started, applied=None,
+             refresh=None, cached=0):
+        """applied: every applicant key from an addon paste (see search), else None. refresh: the
+        row being looked up again. started is None when nothing was fetched; cached is how many
+        characters came from the cache."""
         self.btn.state(["!disabled"])
         if err:
             if isinstance(err, urllib.error.HTTPError) and err.code in (400, 401):
@@ -942,12 +1008,15 @@ class App:
         new = [
             {
                 "name": name, "realm": realm, "slug": slug, "region": region, "zone": zone,
-                "metric": metric, "char": char, "lfg": applied is not None,
+                "metric": metric, "char": char,
+                "lfg": applied is not None or bool(refresh and refresh.get("lfg")),
             }
             for (name, realm), slug, char in zip(chars, slugs, results)
         ]
         ids = {self._row_id(r) for r in new}
         took = f"Done in {time.perf_counter() - started:.2f}s" if started else ""
+        if cached:
+            took += f" ({'all' if cached == len(chars) else cached} from cache)"
         if applied is not None:
             # Applicants missing from this paste left the queue; people added by hand stay
             gone = [r for r in self.rows if r.get("lfg") and self._lfg_key(r) not in applied]
@@ -955,6 +1024,9 @@ class App:
                 self.expanded.pop(self._row_id(r), None)
             self.rows = [r for r in self.rows if r not in gone and self._row_id(r) not in ids] + new
             self.done_msg = "  |  ".join(filter(None, [f"Applicants: {len(new)} new, {len(gone)} left", took]))
+        elif refresh is not None:
+            self.rows = [new[0] if r is refresh else r for r in self.rows]  # same spot in the list
+            self.done_msg = f"Refreshed {new[0]['name']}  |  {took}"
         elif self.keep.get():
             self.rows = [r for r in self.rows if self._row_id(r) not in ids] + new  # re-search = refresh
             self.entry.delete(0, "end")  # ready for the next name
@@ -1213,6 +1285,7 @@ class App:
         self.menu.add_command(label="Open Warcraft Logs", command=lambda: webbrowser.open(self.links[item]))
         self.menu.add_command(label="Open Raider.IO", command=lambda: webbrowser.open(raiderio))
         self.menu.add_command(label=f"Copy {full}", command=lambda: self.copy(full))
+        self.menu.add_command(label="Refresh (skip cache)", command=lambda: self.search(refresh=row))
         self.menu.add_separator()
         self.menu.add_command(label="Remove", command=lambda: self.remove(item))
         self.menu.tk_popup(event.x_root, event.y_root)

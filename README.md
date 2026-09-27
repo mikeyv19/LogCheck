@@ -15,8 +15,11 @@ DPS, median percentile across all runs, and run count. Every character is fetche
 - **Keep adding mode.** Stack several lookups into one list to compare applicants. Remove people one by
   one with ✕, or clear the whole list. Characters you collapse stay collapsed as you add more. Turn off
   **Expand new** to add people collapsed, for a compact list.
+- **24-hour cache.** Checking the same person again within 24 hours reuses their last lookup and costs
+  no API points. Right-click a name and choose **Refresh (skip cache)** to get their latest numbers.
+  On by default; turn it off in **Options**.
 - Double-click a name to open their Warcraft Logs page. Right-click a name to open Warcraft Logs or
-  Raider.IO, copy their Name-Realm, or remove them. Press **?** in the app for a full explanation.
+  Raider.IO, copy their Name-Realm, refresh them, or remove them. Press **?** in the app for a full explanation.
 
 ## Requirements
 
@@ -69,7 +72,8 @@ This writes `logcheck.ico`. Right-click `logcheck.pyw` → **Create shortcut**, 
 - **Options** lets you color rows by DPS instead of parse %. You set one reference DPS (per zone and metric),
   and rows get the parse colors by their % of it, e.g. 75% of the reference = purple.
 - The API allows a set number of points per hour, and the remaining amount is shown bottom-right.
-  Each lookup costs roughly 8 points per character.
+  Each lookup costs roughly 8 points per character. Anyone looked up in the last 24 hours comes from the
+  cache (`logcheck_cache.json`, next to the script) and costs nothing. Delete that file to clear it.
 
 ## WoW addon: paste your whole applicant list
 
