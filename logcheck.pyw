@@ -28,13 +28,14 @@ API_URL = "https://www.warcraftlogs.com/api/v2/client"
 
 DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_mode": "Min %", "min_pct": "", "min_dps": "", "min_key": "", "dungeon": "", "keep": False,
             "expand_new": True, "sort_col": "", "sort_desc": True,
-            "color_by": "parse", "ref_amount": {}}  # ref_amount: "zone:metric" -> reference DPS text
+            "color_by": "parse", "ref_amount": {},  # ref_amount: "zone:metric" -> reference DPS text
+            "dps_tiers": {}}  # dps_tiers: "zone:metric" -> {band %: min DPS text} for custom DPS colors
 TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
 ALL_DUNGEONS = "All dungeons"
 MIN_MODES = {"Min %": "min_pct", "Min DPS": "min_dps"}  # threshold mode -> config key for its value
 
 # Warcraft Logs parse colors: (min percent, color)
-PARSE_COLORS = [
+PARSE_COLORS = [  # names: see COLOR_NAMES
     (100, "#e5cc80"),
     (99, "#e268a8"),
     (95, "#ff8000"),
@@ -43,6 +44,7 @@ PARSE_COLORS = [
     (25, "#1eff00"),
     (0, "#9d9d9d"),
 ]
+COLOR_NAMES = ["Gold", "Pink", "Orange", "Purple", "Blue", "Green", "Gray"]
 
 BG = "#1e1e1e"
 FG = "#dddddd"
@@ -337,7 +339,8 @@ SORTING
 
 COLORS  (by default, rows are colored by whatever "Judge by" is set to.
          In Options you can color by DPS instead: the same bands as a %
-         of a reference DPS you set, e.g. 75% of it = purple)
+         of a reference DPS you set, e.g. 75% of it = purple, or type
+         your own minimum DPS for each color with "DPS (custom)")
   Gray    0-24    below average
   Green   25-49   slightly below average
   Blue    50-74   solid, above average
@@ -494,6 +497,7 @@ class App:
         self.root = root
         self.cfg = {**DEFAULTS, **load_config()}
         self.cfg["ref_amount"] = dict(self.cfg["ref_amount"])  # don't mutate DEFAULTS
+        self.cfg["dps_tiers"] = dict(self.cfg["dps_tiers"])
         self.links = {}  # tree item id -> character URL
 
         root.title("LogCheck")
@@ -754,7 +758,8 @@ class App:
 
         ttk.Label(frame, text="Color rows by:").grid(row=0, column=0, sticky="w")
         color_by = tk.StringVar(value=self.cfg["color_by"])
-        for i, (value, text) in enumerate([("parse", "Parse %"), ("dps", "DPS")]):
+        modes = [("parse", "Parse %"), ("dps", "DPS (% of reference)"), ("dps_custom", "DPS (custom)")]
+        for i, (value, text) in enumerate(modes):
             ttk.Radiobutton(frame, text=text, value=value, variable=color_by).grid(
                 row=0, column=1 + i, sticky="w", padx=(8, 0))
 
@@ -763,45 +768,75 @@ class App:
             row=1, column=0, sticky="w", pady=(10, 0))
         ref = ttk.Entry(frame, width=12)
         ref.insert(0, self.cfg["ref_amount"].get(key, ""))
-        ref.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
-        ttk.Label(
-            frame, foreground="#9d9d9d", wraplength=340, justify="left",
-            text="Roughly the top DPS for the keys you run this season (450k / 1.2m work). "
-                 "Colors use the parse bands as a % of it. Saved separately for each zone "
-                 "and metric, so set it again when the season changes.",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        ref.grid(row=1, column=1, columnspan=3, sticky="w", padx=(8, 0), pady=(10, 0))
+        hint = ttk.Label(frame, foreground="#9d9d9d", wraplength=400, justify="left")
+        hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 8))
 
+        # One row per color: computed range in reference mode, an editable minimum in custom mode
         tiers = ttk.Frame(frame)
-        tiers.grid(row=3, column=0, columnspan=3, sticky="w")
-        tier_labels = [ttk.Label(tiers, foreground=color) for _, color in PARSE_COLORS]
-        for label in tier_labels:
-            label.pack(anchor="w")
+        tiers.grid(row=3, column=0, columnspan=4, sticky="w")
+        saved = self.cfg["dps_tiers"].get(key, {})
+        tier_rows = []
+        for i, ((pct, color), name) in enumerate(zip(PARSE_COLORS, COLOR_NAMES)):
+            ttk.Label(tiers, text=name, foreground=color, width=8).grid(row=i, column=0, sticky="w")
+            computed = ttk.Label(tiers, foreground=color)
+            computed.grid(row=i, column=1, sticky="w")
+            entry = ttk.Entry(tiers, width=10) if pct else ttk.Label(tiers, foreground=color)
+            entry.grid(row=i, column=2, sticky="w", pady=1)
+            if pct:
+                entry.insert(0, saved.get(str(pct), ""))
+                entry.bind("<KeyRelease>", lambda e: update())
+            tier_rows.append((pct, computed, entry))
 
         def update(*_):
-            dps_mode = color_by.get() == "dps"
-            ref.state(["!disabled"] if dps_mode else ["disabled"])
+            mode = color_by.get()
+            ref.state(["!disabled"] if mode == "dps" else ["disabled"])
+            hint.config(text={
+                "parse": "Rows use the same colors as Warcraft Logs parse %.",
+                "dps": "Roughly the top DPS for the keys you run this season (450k / 1.2m work). "
+                       "Colors use the parse bands as a % of it. Saved separately for each zone "
+                       "and metric, so set it again when the season changes.",
+                "dps_custom": "Minimum DPS for each color (450k / 1.2m work). Leave a color blank to "
+                              "skip it; anything below every minimum is gray. Saved separately for "
+                              "each zone and metric.",
+            }[mode])
             amount = to_amount(ref.get())
-            for label, (pct, _) in zip(tier_labels, PARSE_COLORS):
-                if pct:
-                    label.config(text=f"{pct:>3}%+   " + (f">= {fmt_amount(amount * pct / 100)}" if amount else ""))
+            custom = {}
+            for pct, computed, entry in tier_rows:
+                if mode == "dps_custom":
+                    computed.grid_remove()
+                    entry.grid()
+                    if pct and entry.get().strip():
+                        custom[str(pct)] = entry.get().strip()
+                    elif not pct:
+                        entry.config(text="below the rest")
                 else:
-                    label.config(text="<25%    " + (f"< {fmt_amount(amount * 0.25)}" if amount else ""))
-            if dps_mode:
-                tiers.grid()
-            else:
+                    entry.grid_remove()
+                    computed.grid()
+                    if pct:
+                        computed.config(text=f"{pct:>3}%+   " + (f">= {fmt_amount(amount * pct / 100)}" if amount else ""))
+                    else:
+                        computed.config(text="<25%    " + (f"< {fmt_amount(amount * 0.25)}" if amount else ""))
+            if mode == "parse":
                 tiers.grid_remove()
-            self.cfg["color_by"] = color_by.get()
+            else:
+                tiers.grid()
+            self.cfg["color_by"] = mode
             text = ref.get().strip()
             if text:
                 self.cfg["ref_amount"][key] = text
             else:
                 self.cfg["ref_amount"].pop(key, None)
+            if custom:
+                self.cfg["dps_tiers"][key] = custom
+            else:
+                self.cfg["dps_tiers"].pop(key, None)
             self.render()  # saves the config and recolors live
 
         color_by.trace_add("write", update)
         ref.bind("<KeyRelease>", update)
         update()
-        ttk.Button(frame, text="Close", command=win.destroy).grid(row=4, column=0, columnspan=3, pady=(12, 0))
+        ttk.Button(frame, text="Close", command=win.destroy).grid(row=4, column=0, columnspan=4, pady=(12, 0))
         win.bind("<Escape>", lambda e: win.destroy())
         win.focus_set()
 
@@ -1008,6 +1043,8 @@ class App:
                 to_amount(self.cfg["ref_amount"].get(self.ref_key(r["zone"], r["metric"]), "")) for r in self.rows
             ):
                 parts.append("set a reference DPS in Options to color by DPS")
+            if self.cfg["color_by"] == "dps_custom" and not all(self._custom_tiers(r) for r in self.rows):
+                parts.append("set DPS colors in Options to color by DPS")
         if parts:
             self.status.config(text="  |  ".join(parts))
 
@@ -1070,9 +1107,22 @@ class App:
         self.tree.tag_configure(tag, foreground=color)
         return tag
 
+    def _custom_tiers(self, row):
+        """[(min DPS, band %)] high-to-low from the custom DPS colors set for this row's zone/metric."""
+        saved = self.cfg["dps_tiers"].get(self.ref_key(row["zone"], row["metric"]), {})
+        tiers = [(to_amount(saved.get(str(pct), "")), pct) for pct, _ in PARSE_COLORS if pct]
+        return sorted((t for t in tiers if t[0] is not None), reverse=True)
+
     def _row_color_tag(self, row, pct, amount):
-        """Parse-% color, or in DPS mode the same bands as a % of the reference DPS."""
-        if self.cfg["color_by"] != "dps":
+        """Parse-% color; in DPS mode the same bands as a % of the reference DPS,
+        or in custom mode the band of the highest minimum DPS the row reaches."""
+        mode = self.cfg["color_by"]
+        if mode == "dps_custom":
+            tiers = self._custom_tiers(row)
+            if not tiers or amount is None:
+                return self._color_tag(None)
+            return self._color_tag(next((p for minimum, p in tiers if amount >= minimum), 0))
+        if mode != "dps":
             return self._color_tag(pct)
         ref = to_amount(self.cfg["ref_amount"].get(self.ref_key(row["zone"], row["metric"]), ""))
         return self._color_tag(amount / ref * 100 if ref and amount else None)
