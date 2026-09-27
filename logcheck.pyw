@@ -33,6 +33,7 @@ DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "m
 TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
 ALL_DUNGEONS = "All dungeons"
 MIN_MODES = {"Min %": "min_pct", "Min DPS": "min_dps"}  # threshold mode -> config key for its value
+LFG_PREFIX = "LFG:"  # starts the LogCheck addon's export of your whole applicant list
 
 # Warcraft Logs parse colors: (min percent, color)
 PARSE_COLORS = [  # names: see COLOR_NAMES
@@ -298,6 +299,13 @@ HOW TO USE
   remove them.
 
   Click a column header to sort by it (click again to flip the order).
+
+  WoW ADDON (addon/LogCheck in the LogCheck folder): click the "LogCheck"
+  button at the top-right of your group's applicant list (or type
+  /logcheck), press Ctrl+C, then Ctrl+V here. Every applicant is pasted at once. Paste again
+  whenever the list changes: only new applicants are looked up (no wasted
+  API points), and applicants who left the queue are removed. People you
+  added by hand stay. Tip: turn off "Expand new" for a compact list.
 
   Tick "Keep adding" to stack lookups: each search adds to the list instead
   of replacing it (searching someone already listed refreshes them), so you
@@ -858,15 +866,28 @@ class App:
         save_config(self.cfg)
         return True
 
-    def search(self):
+    def search(self, lfg=None):
+        """Looks up the Characters box. With lfg (the addon's applicant list), syncs the list to it
+        instead: only applicants not already listed are fetched, and applicants who left are removed."""
         try:
-            chars = parse_characters(self.entry.get())
+            chars = parse_characters(self.entry.get() if lfg is None else lfg)
         except ValueError as e:
             self.status.config(text=str(e))
             return
+        region, metric, zone = self.region.get(), self.metric.get(), self.zone.get()
+        applied = None
+        if lfg is not None:
+            fresh = {}  # applicant key -> (name, realm), without repeats
+            for name, realm in chars:
+                fresh.setdefault((name.lower(), realm_key(realm), region, zone, metric), (name, realm))
+            applied = set(fresh)
+            listed = {self._lfg_key(r) for r in self.rows}
+            chars = [c for key, c in fresh.items() if key not in listed]
+            if not chars:  # nobody new: just drop whoever left, no API call
+                self.show([], region, zone, metric, [], [], None, None, None, applied)
+                return
         if not chars or not self.ensure_credentials():
             return
-        region, metric, zone = self.region.get(), self.metric.get(), self.zone.get()
         self.cfg.update(region=region, metric=metric, zone=zone)
         save_config(self.cfg)
 
@@ -881,7 +902,7 @@ class App:
             except Exception as e:  # show any network/API failure in the status bar
                 results, slugs, rate, err = None, None, None, e
             self.root.after(
-                0, lambda: self.show(chars, region, zone, metric, results, slugs, rate, err, started)
+                0, lambda: self.show(chars, region, zone, metric, results, slugs, rate, err, started, applied)
             )
 
         threading.Thread(target=work, daemon=True).start()
@@ -896,12 +917,17 @@ class App:
         if not text:
             self.status.config(text="Clipboard is empty")
             return "break"
+        if text.startswith(LFG_PREFIX):
+            self.search(lfg=text[len(LFG_PREFIX):])
+            return "break"
         self.entry.delete(0, "end")
         self.entry.insert(0, text)
         self.search()
         return "break"
 
-    def show(self, chars, region, zone, metric, results, slugs, rate, err, started):
+    def show(self, chars, region, zone, metric, results, slugs, rate, err, started, applied=None):
+        """applied: every applicant key from an addon paste (see search), else None.
+        started is None when nothing was fetched."""
         self.btn.state(["!disabled"])
         if err:
             if isinstance(err, urllib.error.HTTPError) and err.code in (400, 401):
@@ -916,19 +942,29 @@ class App:
         new = [
             {
                 "name": name, "realm": realm, "slug": slug, "region": region, "zone": zone,
-                "metric": metric, "char": char,
+                "metric": metric, "char": char, "lfg": applied is not None,
             }
             for (name, realm), slug, char in zip(chars, slugs, results)
         ]
-        if self.keep.get():
-            ids = {self._row_id(r) for r in new}
+        ids = {self._row_id(r) for r in new}
+        took = f"Done in {time.perf_counter() - started:.2f}s" if started else ""
+        if applied is not None:
+            # Applicants missing from this paste left the queue; people added by hand stay
+            gone = [r for r in self.rows if r.get("lfg") and self._lfg_key(r) not in applied]
+            for r in gone:
+                self.expanded.pop(self._row_id(r), None)
+            self.rows = [r for r in self.rows if r not in gone and self._row_id(r) not in ids] + new
+            self.done_msg = "  |  ".join(filter(None, [f"Applicants: {len(new)} new, {len(gone)} left", took]))
+        elif self.keep.get():
             self.rows = [r for r in self.rows if self._row_id(r) not in ids] + new  # re-search = refresh
             self.entry.delete(0, "end")  # ready for the next name
+            self.done_msg = took
         else:
             self.rows = new
+            self.done_msg = took
         self.refresh_dungeons()  # encounter list is cached on first lookup of a zone
-        self.done_msg = f"Done in {time.perf_counter() - started:.2f}s"
-        self.rate_label.config(text=fmt_rate(rate))
+        if rate:
+            self.rate_label.config(text=fmt_rate(rate))
         self.render()
 
     def sort_on(self, col):
@@ -1130,6 +1166,11 @@ class App:
     @staticmethod
     def _row_id(row):
         return (row["name"].lower(), row["slug"], row["region"])
+
+    @staticmethod
+    def _lfg_key(row):
+        """Matches a listed row to a pasted applicant before lookup, when there's no slug yet."""
+        return (row["name"].lower(), realm_key(row["realm"]), row["region"], row["zone"], row["metric"])
 
     def save_keep(self):
         self.cfg["keep"] = self.keep.get()

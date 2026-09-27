@@ -70,3 +70,18 @@ This writes `logcheck.ico`. Right-click `logcheck.pyw` → **Create shortcut**, 
   and rows get the parse colors by their % of it, e.g. 75% of the reference = purple.
 - The API allows a set number of points per hour, and the remaining amount is shown bottom-right.
   Each lookup costs roughly 8 points per character.
+
+## WoW addon: paste your whole applicant list
+
+The `addon/LogCheck` folder is a small in-game addon. It never talks to the internet or to LogCheck. It
+only puts your applicants' names in a box for you to copy.
+
+1. Copy the `addon/LogCheck` folder into `World of Warcraft/_retail_/Interface/AddOns/`.
+2. While your group is listed, click the **LogCheck** button at the top-right of the applicant list (or type `/logcheck`).
+3. Press **Ctrl+C** (the box closes), then **Ctrl+V** in LogCheck.
+
+Paste again whenever the applicant list changes. LogCheck looks up only the new applicants, so you don't
+spend API points twice, and it removes applicants who have left the queue. People you added by hand stay.
+
+If WoW lists the addon as out of date, check your game version with `/dump select(4, GetBuildInfo())` and
+add that number to the `## Interface:` line in `LogCheck.toc`, or tick **Load out of date AddOns**.

@@ -1,0 +1,6 @@
+## Interface: 120100
+## Title: LogCheck
+## Notes: Copies every LFG applicant's Name-Realm at once, to paste into the LogCheck desktop app.
+## Version: 1.0
+
+LogCheck.lua
