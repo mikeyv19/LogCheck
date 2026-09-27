@@ -27,7 +27,8 @@ TOKEN_URL = "https://www.warcraftlogs.com/oauth/token"
 API_URL = "https://www.warcraftlogs.com/api/v2/client"
 
 DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_mode": "Min %", "min_pct": "", "min_dps": "", "min_key": "", "dungeon": "", "keep": False,
-            "expand_new": True, "sort_col": "", "sort_desc": True}
+            "expand_new": True, "sort_col": "", "sort_desc": True,
+            "color_by": "parse", "ref_amount": {}}  # ref_amount: "zone:metric" -> reference DPS text
 TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
 ALL_DUNGEONS = "All dungeons"
 MIN_MODES = {"Min %": "min_pct", "Min DPS": "min_dps"}  # threshold mode -> config key for its value
@@ -287,7 +288,8 @@ HELP_TEXT = """\
 HOW TO USE
   Type characters as "Name Realm" or "Name-Realm", separated by commas, then
   press Enter. All characters are fetched in one request, so a whole group is
-  as fast as one person. Names copied from in-game work too, e.g.
+  as fast as one person. Or copy names and press Ctrl+V anywhere in the
+  window (or click "Paste & Check") to paste them in and check right away. Names copied from in-game work too, e.g.
   "Name-MoonGuard" or "Name-Area52" (realm spaces are optional).
   Double-click a character's name to open their Warcraft Logs page, or
   right-click it to open Warcraft Logs / Raider.IO, copy Name-Realm, or
@@ -316,6 +318,9 @@ COLUMNS
   Key %     Their percentile ON that highest key - how well they actually
             played at the level they're pushing.
   DPS       Their DPS on that highest key.
+  All DPS   Shown when a Dungeon is selected (DPS then reads "Dungeon
+            DPS"): the character's average DPS across ALL dungeons, as
+            if no dungeon were selected, to compare against that one.
   Median %  Middle of ALL their runs in that dungeon (each run vs its own
             key level). Half their runs are above, half below.
   Runs      Number of logged runs behind the numbers.
@@ -330,7 +335,9 @@ SORTING
   row, and each character's dungeons by the same column. The sort stays
   as people are added or filters change, and is remembered next time.
 
-COLORS  (rows are colored by whatever "Judge by" is set to)
+COLORS  (by default, rows are colored by whatever "Judge by" is set to.
+         In Options you can color by DPS instead: the same bands as a %
+         of a reference DPS you set, e.g. 75% of it = purple)
   Gray    0-24    below average
   Green   25-49   slightly below average
   Blue    50-74   solid, above average
@@ -382,7 +389,8 @@ COLUMN_TIPS = {
     "#0": "Dungeon. Bold rows are the character (double-click to open WCL). Click any header to sort.",
     "key": "Highest key run in this dungeon. +17 = timed, 17 \u2717 = depleted.",
     "keypct": "Percentile on their highest key, vs same spec at the same key level.",
-    "amount": "DPS on their highest key.",
+    "amount": "DPS on their highest key. With a dungeon selected, that dungeon's DPS.",
+    "alldps": "Average DPS across ALL dungeons (ignores the dungeon filter), to compare with Dungeon DPS.",
     "median": "Median percentile of all their runs (each vs its own key level). Best signal for consistency.",
     "runs": "Number of logged runs. More runs = more reliable numbers.",
     "spec": "Spec used on the highest key.",
@@ -485,12 +493,13 @@ class App:
     def __init__(self, root):
         self.root = root
         self.cfg = {**DEFAULTS, **load_config()}
+        self.cfg["ref_amount"] = dict(self.cfg["ref_amount"])  # don't mutate DEFAULTS
         self.links = {}  # tree item id -> character URL
 
         root.title("LogCheck")
         self.app_icon = make_app_icon()
         root.iconphoto(True, self.app_icon)
-        root.geometry("720x520")
+        root.geometry("820x520")
         root.configure(bg=BG)
         self._style()
 
@@ -572,10 +581,21 @@ class App:
         Tooltip(root, expand_box, "On: newly added characters show their dungeons. Off: they're added "
                 "collapsed, for a compact list. People already listed keep however you left them.")
 
-        help_btn = ttk.Button(top, text="?", width=3, command=self.show_help)
-        help_btn.grid(row=1, column=6, sticky="e", padx=(0, 6), pady=(6, 0))
+        side = ttk.Frame(top)
+        side.grid(row=1, column=6, sticky="e", padx=(0, 6), pady=(6, 0))
+        help_btn = ttk.Button(side, text="?", width=3, command=self.show_help)
+        help_btn.pack(side="right")
+        options_btn = ttk.Button(side, text="Options", command=self.show_options)
+        options_btn.pack(side="right", padx=(0, 6))
         self.btn = ttk.Button(top, text="Check", command=self.search)
         self.btn.grid(row=1, column=7, sticky="e", pady=(6, 0))
+        paste_btn = ttk.Button(top, text="Paste & Check", command=self.paste_search)
+        paste_btn.grid(row=2, column=6, columnspan=2, sticky="e", pady=(6, 0))
+        # Ctrl+V anywhere in the window pastes into Characters and checks. The small
+        # filter boxes keep normal paste (see paste_search).
+        for seq in ("<Control-v>", "<Control-V>"):
+            self.entry.bind(seq, self.paste_search)
+            root.bind(seq, self.paste_search)
         top.columnconfigure(6, weight=1)
 
         Tooltip(root, self.entry, "Name Realm or Name-Realm. Separate multiple characters with commas.")
@@ -583,6 +603,9 @@ class App:
         Tooltip(root, self.metric, "dps for damage dealers, hps for healers.")
         Tooltip(root, self.zone, "Warcraft Logs zone ID (from ?zone= in the URL). 55 = Mythic+ Season 2.")
         Tooltip(root, help_btn, "What do these numbers mean?")
+        Tooltip(root, options_btn, "Display settings, such as coloring rows by DPS instead of parse %.")
+        Tooltip(root, paste_btn, "Replace Characters with your clipboard and check. "
+                "Ctrl+V does the same from anywhere in the window.")
         Tooltip(root, self.judge, "Which percentile the threshold checks. Median (typical run) is "
                 "the better predictor; Key % is how they did on their highest key.")
         Tooltip(root, self.min_mode, "Threshold by percentile (Min %) or raw DPS on their highest key "
@@ -594,7 +617,7 @@ class App:
         Tooltip(root, self.dungeon, "Only show one dungeon. Character rows are then judged on that "
                 "dungeon alone. List comes from the zone's dungeons; remembered between sessions.")
 
-        cols = ("key", "keypct", "amount", "median", "runs", "spec", "remove")
+        cols = ("key", "keypct", "amount", "alldps", "median", "runs", "spec", "remove")
         self.tree = ttk.Treeview(root, columns=cols, show="tree headings")
         self.titles = {"#0": "Dungeon"}
         self.sort_col, self.sort_desc = self.cfg["sort_col"], self.cfg["sort_desc"]
@@ -604,6 +627,7 @@ class App:
             ("key", "Key", 55),
             ("keypct", "Key %", 70),
             ("amount", "DPS", 90),
+            ("alldps", "All DPS", 80),
             ("median", "Median %", 80),
             ("runs", "Runs", 60),
             ("spec", "Spec", 110),
@@ -666,6 +690,9 @@ class App:
         s.map("TCheckbutton", background=[("active", BG)], foreground=[("active", FG)],
               indicatorbackground=[("pressed", HOVER_BG), ("active", HOVER_BG)])
         s.configure("TCheckbutton", indicatorbackground=HEADER_BG, indicatorforeground=FG)
+        s.map("TRadiobutton", background=[("active", BG)], foreground=[("active", FG)],
+              indicatorbackground=[("pressed", HOVER_BG), ("active", HOVER_BG)])
+        s.configure("TRadiobutton", indicatorbackground=HEADER_BG, indicatorforeground=FG)
         s.configure("Treeview", background=BG, fieldbackground=BG, foreground=FG, rowheight=22)
         s.configure("Treeview.Heading", background=HEADER_BG, foreground=FG)
         s.map("Treeview.Heading", background=[("pressed", PRESS_BG), ("active", HOVER_BG)])
@@ -677,7 +704,7 @@ class App:
         if self.tree.identify_region(event.x, event.y) != "heading":
             return self._hide_head_tip()
         col = self.tree.identify_column(event.x)
-        col = "#0" if col == "#0" else self.tree["columns"][int(col[1:]) - 1]
+        col = "#0" if col == "#0" else self.tree.column(col, "id")
         if col != self.head_col:
             self.head_col = col
             self.head_tip.show(COLUMN_TIPS.get(col, ""), event.x_root, event.y_root)
@@ -708,6 +735,73 @@ class App:
         text.tag_configure("h", foreground="#e5cc80", font=("Consolas", 10, "bold"))
         text.configure(state="disabled")
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=10)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_set()
+
+    def ref_key(self, zone=None, metric=None):
+        """Config key for the reference DPS: one per zone (season) and metric."""
+        zone = (self.zone.get() if zone is None else zone).strip()
+        return f"{zone}:{self.metric.get() if metric is None else metric}"
+
+    def show_options(self):
+        win = tk.Toplevel(self.root)
+        win.title("LogCheck - Options")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Color rows by:").grid(row=0, column=0, sticky="w")
+        color_by = tk.StringVar(value=self.cfg["color_by"])
+        for i, (value, text) in enumerate([("parse", "Parse %"), ("dps", "DPS")]):
+            ttk.Radiobutton(frame, text=text, value=value, variable=color_by).grid(
+                row=0, column=1 + i, sticky="w", padx=(8, 0))
+
+        key, metric = self.ref_key(), self.metric.get()
+        ttk.Label(frame, text=f"Reference {metric.upper()} (zone {key.split(':')[0]}):").grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
+        ref = ttk.Entry(frame, width=12)
+        ref.insert(0, self.cfg["ref_amount"].get(key, ""))
+        ref.grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(
+            frame, foreground="#9d9d9d", wraplength=340, justify="left",
+            text="Roughly the top DPS for the keys you run this season (450k / 1.2m work). "
+                 "Colors use the parse bands as a % of it. Saved separately for each zone "
+                 "and metric, so set it again when the season changes.",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+        tiers = ttk.Frame(frame)
+        tiers.grid(row=3, column=0, columnspan=3, sticky="w")
+        tier_labels = [ttk.Label(tiers, foreground=color) for _, color in PARSE_COLORS]
+        for label in tier_labels:
+            label.pack(anchor="w")
+
+        def update(*_):
+            dps_mode = color_by.get() == "dps"
+            ref.state(["!disabled"] if dps_mode else ["disabled"])
+            amount = to_amount(ref.get())
+            for label, (pct, _) in zip(tier_labels, PARSE_COLORS):
+                if pct:
+                    label.config(text=f"{pct:>3}%+   " + (f">= {fmt_amount(amount * pct / 100)}" if amount else ""))
+                else:
+                    label.config(text="<25%    " + (f"< {fmt_amount(amount * 0.25)}" if amount else ""))
+            if dps_mode:
+                tiers.grid()
+            else:
+                tiers.grid_remove()
+            self.cfg["color_by"] = color_by.get()
+            text = ref.get().strip()
+            if text:
+                self.cfg["ref_amount"][key] = text
+            else:
+                self.cfg["ref_amount"].pop(key, None)
+            self.render()  # saves the config and recolors live
+
+        color_by.trace_add("write", update)
+        ref.bind("<KeyRelease>", update)
+        update()
+        ttk.Button(frame, text="Close", command=win.destroy).grid(row=4, column=0, columnspan=3, pady=(12, 0))
         win.bind("<Escape>", lambda e: win.destroy())
         win.focus_set()
 
@@ -756,6 +850,21 @@ class App:
             )
 
         threading.Thread(target=work, daemon=True).start()
+
+    def paste_search(self, event=None):
+        if event and event.widget in (self.zone, self.min_value, self.min_key):
+            return None  # the Entry class binding already pasted normally
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:  # empty or non-text clipboard
+            text = ""
+        if not text:
+            self.status.config(text="Clipboard is empty")
+            return "break"
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+        self.search()
+        return "break"
 
     def show(self, chars, region, zone, metric, results, slugs, rate, err, started):
         self.btn.state(["!disabled"])
@@ -832,6 +941,10 @@ class App:
         self.cfg[MIN_MODES[self.min_mode.get()]] = self.min_value.get()
         self.cfg.update(judge=self.judge.get(), min_mode=self.min_mode.get(), min_key=self.min_key.get(), dungeon=only)
         save_config(self.cfg)
+        # With one dungeon selected, DPS is that dungeon's and All DPS shows every dungeon for comparison
+        self.titles["amount"] = "Dungeon DPS" if only else "DPS"
+        self.tree["displaycolumns"] = [c for c in self.tree["columns"] if only or c != "alldps"]
+        self.update_headings()
         for item, row in self.items.items():  # remember what the user expanded/collapsed
             self.expanded[self._row_id(row)] = bool(self.tree.item(item, "open"))
         self.tree.delete(*self.tree.get_children())
@@ -855,12 +968,13 @@ class App:
                     fmt_key(c["top_key"], c["timed"]),
                     fmt_pct(c["keypct"]),
                     fmt_amount(c["amount"]),
+                    fmt_amount(c["alldps"]),
                     fmt_pct(c["median"]),
                     c["runs"] or "",
                     c["spec"] or "",
                     "\u2715",
                 ),
-                tags=(self._color_tag(self.judged_pct(c["keypct"], c["median"])), "header"),
+                tags=(self._row_color_tag(row, self.judged_pct(c["keypct"], c["median"]), c["amount"]), "header"),
             )
             self.links[parent] = c["url"]
             self.items[parent] = row
@@ -877,18 +991,23 @@ class App:
                         fmt_key(d["key"], d["timed"]),
                         fmt_pct(d["key_pct"]),
                         fmt_amount(d["dps"]),
+                        "",
                         fmt_pct(d["median"]),
                         d["runs"],
                         d["spec"],
                         "",
                     ),
-                    tags=(self._color_tag(self.judged_pct(d["key_pct"], d["median"])),),
+                    tags=(self._row_color_tag(row, self.judged_pct(d["key_pct"], d["median"]), d["dps"]),),
                 )
         self.tree.tag_configure("header", font=("Segoe UI", 10, "bold"), background=HEADER_BG)
         extra = f"{passed}/{judged} meet the threshold" if judged else "double-click a name to open WCL"
         parts = [self.done_msg] if self.done_msg else []
         if self.rows:
             parts += [f"{len(self.rows)} listed", extra]
+            if self.cfg["color_by"] == "dps" and not all(
+                to_amount(self.cfg["ref_amount"].get(self.ref_key(r["zone"], r["metric"]), "")) for r in self.rows
+            ):
+                parts.append("set a reference DPS in Options to color by DPS")
         if parts:
             self.status.config(text="  |  ".join(parts))
 
@@ -896,9 +1015,8 @@ class App:
     def _summarize(row, only):
         """Character-row numbers (and sort values, keyed by column) for one listed character."""
         name, realm, char = row["name"], row["realm"], row["char"]
-        dungeons = [
-            d for d in (char or {}).get("dungeons", []) if d["runs"] and (not only or d["name"] == only)
-        ]
+        all_dungeons = [d for d in (char or {}).get("dungeons", []) if d["runs"]]
+        dungeons = [d for d in all_dungeons if not only or d["name"] == only]
         if char is None:
             label = f"{name}-{realm}  (not found)"
         elif char["error"] and not dungeons:
@@ -927,6 +1045,7 @@ class App:
             "key": (top_key, bool(timed)) if top_key else None,
             "keypct": mean(d["key_pct"] for d in dungeons),
             "amount": mean(d["dps"] for d in dungeons),
+            "alldps": mean(d["dps"] for d in all_dungeons),
             "median": mean(d["median"] for d in dungeons),
             "runs": sum(d["runs"] for d in dungeons) or None,
             "spec": top["spec"] if top and top["spec"] else None,
@@ -939,6 +1058,7 @@ class App:
             "key": (d["key"], d["timed"]) if d["key"] else None,
             "keypct": d["key_pct"],
             "amount": d["dps"],
+            "alldps": None,
             "median": d["median"],
             "runs": d["runs"],
             "spec": d["spec"].lower() or None,
@@ -949,6 +1069,13 @@ class App:
         tag = "c" + color.lstrip("#")
         self.tree.tag_configure(tag, foreground=color)
         return tag
+
+    def _row_color_tag(self, row, pct, amount):
+        """Parse-% color, or in DPS mode the same bands as a % of the reference DPS."""
+        if self.cfg["color_by"] != "dps":
+            return self._color_tag(pct)
+        ref = to_amount(self.cfg["ref_amount"].get(self.ref_key(row["zone"], row["metric"]), ""))
+        return self._color_tag(amount / ref * 100 if ref and amount else None)
 
     @staticmethod
     def _row_id(row):
@@ -966,7 +1093,7 @@ class App:
         if self.tree.identify_region(event.x, event.y) != "cell":
             return
         col = self.tree.identify_column(event.x)
-        if col != "#0" and self.tree["columns"][int(col[1:]) - 1] == "remove":
+        if col != "#0" and self.tree.column(col, "id") == "remove":
             self.remove(self.tree.identify_row(event.y))
             return "break"
 

@@ -66,5 +66,7 @@ This writes `logcheck.ico`. Right-click `logcheck.pyw` → **Create shortcut**, 
 - **Zone ID** is the Warcraft Logs zone (the `?zone=` value in a WCL URL). The default, `55`, is Midnight
   Mythic+ Season 2. The Dungeon filter list comes from the zone you look up.
 - **Metric**: `dps` for damage dealers, `hps` for healers.
+- **Options** lets you color rows by DPS instead of parse %. You set one reference DPS (per zone and metric),
+  and rows get the parse colors by their % of it, e.g. 75% of the reference = purple.
 - The API allows a set number of points per hour, and the remaining amount is shown bottom-right.
   Each lookup costs roughly 8 points per character.
