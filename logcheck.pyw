@@ -26,10 +26,11 @@ CONFIG_PATH = Path(__file__).with_name("logcheck_config.json")
 TOKEN_URL = "https://www.warcraftlogs.com/oauth/token"
 API_URL = "https://www.warcraftlogs.com/api/v2/client"
 
-DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_pct": "", "min_key": "", "dungeon": "", "keep": False,
+DEFAULTS = {"region": "us", "zone": "55", "metric": "dps", "judge": "Median", "min_mode": "Min %", "min_pct": "", "min_dps": "", "min_key": "", "dungeon": "", "keep": False,
             "expand_new": True, "sort_col": "", "sort_desc": True}
 TEXT_COLS = ("#0", "spec")  # sort A-Z first; numbers sort high-to-low first
 ALL_DUNGEONS = "All dungeons"
+MIN_MODES = {"Min %": "min_pct", "Min DPS": "min_dps"}  # threshold mode -> config key for its value
 
 # Warcraft Logs parse colors: (min percent, color)
 PARSE_COLORS = [
@@ -347,6 +348,9 @@ MEDIAN OR KEY %?  -> Use Median.
 THRESHOLDS (green check / red X)
   Judge by   Which percentile to check: Median (recommended) or Key %.
   Min %      Lowest percentile you'll accept. Blank = no % requirement.
+  Min DPS    Pick "Min DPS" in that dropdown to require raw DPS instead
+             (their DPS on the highest key; 450k and 1.2m work). Each
+             mode remembers its own value.
   Min key    Lowest TIMED key you'll accept. Blank = no key requirement.
              Depleted keys don't count toward this.
   Dungeon    Show only one dungeon (e.g. the key you're forming for).
@@ -355,7 +359,8 @@ THRESHOLDS (green check / red X)
   Changing these re-checks instantly, no new lookup needed.
   Dungeon rows are judged on that dungeon's numbers (good when forming for a
   specific dungeon). Character rows are judged on their average % across all
-  dungeons and their highest timed key in any dungeon.
+  dungeons (average DPS for Min DPS) and their highest timed key in any
+  dungeon.
 
   Suggested settings (Judge by Median):
     40   not a liability
@@ -443,6 +448,14 @@ def to_number(s):
         return None
 
 
+def to_amount(s):
+    """DPS threshold: '450000', '450,000', '450k' or '1.2m'."""
+    s = s.strip().lower().replace(",", "")
+    scale = {"k": 1e3, "m": 1e6}.get(s[-1:], 1)
+    n = to_number(s[:-1] if scale != 1 else s)
+    return None if n is None else n * scale
+
+
 class Tooltip:
     """Small hover tooltip. Attach to a widget, or drive manually via show/hide."""
 
@@ -510,10 +523,12 @@ class App:
         self.judge.set(self.cfg["judge"] if self.cfg["judge"] in ("Median", "Key %") else "Median")
         self.judge.grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
 
-        ttk.Label(top, text="Min %:").grid(row=2, column=2, sticky="w", pady=(6, 0))
-        self.min_pct = ttk.Entry(top, width=6)
-        self.min_pct.insert(0, self.cfg["min_pct"])
-        self.min_pct.grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(6, 0))
+        self.min_mode = ttk.Combobox(top, values=list(MIN_MODES), width=8, state="readonly")
+        self.min_mode.set(self.cfg["min_mode"] if self.cfg["min_mode"] in MIN_MODES else "Min %")
+        self.min_mode.grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.min_value = ttk.Entry(top, width=8)
+        self.min_value.insert(0, self.cfg[MIN_MODES[self.min_mode.get()]])
+        self.min_value.grid(row=2, column=3, sticky="w", padx=(6, 12), pady=(6, 0))
 
         ttk.Label(top, text="Min key:").grid(row=2, column=4, sticky="w", pady=(6, 0))
         self.min_key = ttk.Entry(top, width=6)
@@ -528,8 +543,9 @@ class App:
 
         self.judge.bind("<<ComboboxSelected>>", lambda e: self.render())
         self.dungeon.bind("<<ComboboxSelected>>", lambda e: self.render())
+        self.min_mode.bind("<<ComboboxSelected>>", lambda e: self.switch_min_mode())
         self.zone.bind("<KeyRelease>", lambda e: self.refresh_dungeons())
-        for w in (self.min_pct, self.min_key):
+        for w in (self.min_value, self.min_key):
             w.bind("<KeyRelease>", lambda e: self.render())
 
         self.icons = {
@@ -569,8 +585,10 @@ class App:
         Tooltip(root, help_btn, "What do these numbers mean?")
         Tooltip(root, self.judge, "Which percentile the threshold checks. Median (typical run) is "
                 "the better predictor; Key % is how they did on their highest key.")
-        Tooltip(root, self.min_pct, "Minimum percentile to get a green check. Blank = no % requirement. "
-                "Character row uses their average across dungeons.")
+        Tooltip(root, self.min_mode, "Threshold by percentile (Min %) or raw DPS on their highest key "
+                "(Min DPS). Each keeps its own value.")
+        Tooltip(root, self.min_value, "Minimum percentile or DPS to get a green check. Blank = no requirement. "
+                "DPS accepts 450k / 1.2m. Character row uses their average across dungeons.")
         Tooltip(root, self.min_key, "Minimum key level. Blank = no key requirement. "
                 "Only timed keys count. Character row uses their highest timed key anywhere.")
         Tooltip(root, self.dungeon, "Only show one dungeon. Character rows are then judged on that "
@@ -788,13 +806,21 @@ class App:
     def judged_pct(self, key_pct, median):
         return median if self.judge.get() == "Median" else key_pct
 
-    def judge_pass(self, key_pct, median, timed_key):
+    def switch_min_mode(self):
+        """Swaps the threshold box to the chosen mode's own saved value."""
+        self.min_value.delete(0, "end")
+        self.min_value.insert(0, self.cfg[MIN_MODES[self.min_mode.get()]])
+        self.render()
+
+    def judge_pass(self, key_pct, median, amount, timed_key):
         """True/False against the thresholds, or None when no threshold is set."""
-        min_pct, min_key = to_number(self.min_pct.get()), to_number(self.min_key.get())
-        if min_pct is None and min_key is None:
+        by_dps = self.min_mode.get() == "Min DPS"
+        minimum = (to_amount if by_dps else to_number)(self.min_value.get())
+        min_key = to_number(self.min_key.get())
+        if minimum is None and min_key is None:
             return None
-        pct = self.judged_pct(key_pct, median)
-        if min_pct is not None and (pct is None or pct < min_pct):
+        value = amount if by_dps else self.judged_pct(key_pct, median)
+        if minimum is not None and (value is None or value < minimum):
             return False
         if min_key is not None and (timed_key is None or timed_key < min_key):
             return False
@@ -803,9 +829,8 @@ class App:
     def render(self):
         only = self.dungeon.get()
         only = "" if only == ALL_DUNGEONS else only
-        self.cfg.update(
-            judge=self.judge.get(), min_pct=self.min_pct.get(), min_key=self.min_key.get(), dungeon=only
-        )
+        self.cfg[MIN_MODES[self.min_mode.get()]] = self.min_value.get()
+        self.cfg.update(judge=self.judge.get(), min_mode=self.min_mode.get(), min_key=self.min_key.get(), dungeon=only)
         save_config(self.cfg)
         for item, row in self.items.items():  # remember what the user expanded/collapsed
             self.expanded[self._row_id(row)] = bool(self.tree.item(item, "open"))
@@ -819,7 +844,7 @@ class App:
             chars = sort_by(chars, lambda c: c[col], desc)
         for c in chars:
             row, dungeons = c["row"], c["dungeons"]
-            verdict = self.judge_pass(c["keypct"], c["median"], c["max_timed"])
+            verdict = self.judge_pass(c["keypct"], c["median"], c["amount"], c["max_timed"])
             if verdict is not None:
                 judged += 1
                 passed += verdict
@@ -845,7 +870,7 @@ class App:
             else:
                 dungeons = sorted(dungeons, key=lambda d: (d["key"] or 0, d["key_pct"] or 0), reverse=True)
             for d in dungeons:
-                verdict = self.judge_pass(d["key_pct"], d["median"], d["max_timed"])
+                verdict = self.judge_pass(d["key_pct"], d["median"], d["dps"], d["max_timed"])
                 self.tree.insert(
                     parent, "end", image=self.icons[verdict], text=" " + d["name"],
                     values=(

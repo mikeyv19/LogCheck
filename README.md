@@ -9,8 +9,8 @@ DPS, median percentile across all runs, and run count. Every character is fetche
 
 - **Fair percentiles.** Each run is compared only with runs at the same key level, so players who push
   high keys don't look great just because of the key level.
-- **Pass/fail checks.** Set a minimum percentile and/or minimum timed key to get a green check or red X per
-  dungeon and per character.
+- **Pass/fail checks.** Set a minimum percentile (or minimum DPS) and/or minimum timed key to get a green
+  check or red X per dungeon and per character.
 - **Dungeon filter.** Show only one dungeon, such as the key you're forming for. Your choice is remembered.
 - **Keep adding mode.** Stack several lookups into one list to compare applicants. Remove people one by
   one with ✕, or clear the whole list. Characters you collapse stay collapsed as you add more. Turn off
